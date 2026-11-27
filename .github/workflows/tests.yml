@@ -1,0 +1,128 @@
+name: Wazzup autotests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: wazzup-account
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      summary: ${{ steps.stats.outputs.summary }}
+      report_ready: ${{ steps.report.outputs.ready }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: lts/*
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install browser
+        run: npx playwright install --with-deps chromium
+
+      - name: Run tests
+        run: npx playwright test
+        env:
+          WAZZUP_UI_EMAIL: ${{ secrets.WAZZUP_UI_EMAIL }}
+          WAZZUP_UI_PASSWORD: ${{ secrets.WAZZUP_UI_PASSWORD }}
+          WAZZUP_API_KEY: ${{ secrets.WAZZUP_API_KEY }}
+          WEBHOOKS_URI: ${{ secrets.WEBHOOKS_URI }}
+
+      - name: Run results reporter
+        id: stats
+        if: ${{ !cancelled() }}
+        run: |
+          if [ -f playwright-results.json ]; then
+            SUMMARY="Passed: $(jq '.stats.expected' playwright-results.json), Failed: $(jq '.stats.unexpected' playwright-results.json), Flaky: $(jq '.stats.flaky' playwright-results.json), Skipped: $(jq '.stats.skipped' playwright-results.json)"
+          else
+            SUMMARY="Report not created: tests did not run"
+          fi
+          echo "summary=${SUMMARY}" >> "$GITHUB_OUTPUT"
+
+      - name: Check that secrets did not leak into results
+        id: guard
+        if: ${{ !cancelled() }}
+        env:
+          WAZZUP_UI_PASSWORD: ${{ secrets.WAZZUP_UI_PASSWORD }}
+          WAZZUP_API_KEY: ${{ secrets.WAZZUP_API_KEY }}
+        run: |
+          for value in "$WAZZUP_UI_PASSWORD" "$WAZZUP_API_KEY"; do
+            if [ -n "$value" ] && grep -rqF -- "$value" allure-results playwright-report 2>/dev/null; then
+              echo "::error::Секрет найден в результатах прогона, публикация отменена"
+              exit 1
+            fi
+          done
+
+      - name: Generate Allure report (single HTML file)
+        id: report
+        if: ${{ !cancelled() && steps.guard.outcome != 'failure' }}
+        continue-on-error: true
+        run: |
+          npx allure awesome ./allure-results --single-file
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Save report as artifact
+        if: ${{ steps.report.outputs.ready == 'true' }}
+        uses: actions/upload-artifact@v7.0.2
+        continue-on-error: true
+        with:
+          name: allure-report
+          path: allure-report/index.html
+
+      - name: Prepare report for publication
+        if: ${{ steps.report.outputs.ready == 'true' }}
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: allure-report
+
+  publish:
+    needs: tests
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.tests.outputs.report_ready == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    outputs:
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Publish to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
+
+  notify:
+    needs: [tests, publish]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Telegram notification
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RESULT: ${{ needs.tests.result }}
+          SUMMARY: ${{ needs.tests.outputs.summary }}
+          BRANCH: ${{ github.ref_name }}
+          REPORT_URL: ${{ needs.publish.outputs.url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          LINK="${REPORT_URL:-$RUN_URL}"
+          TEXT=$(printf 'Run results for Wazzup tests: %s\n%s\nBranch: %s\nReport: %s' "$RESULT" "$SUMMARY" "$BRANCH" "$LINK")
+          curl --fail-with-body -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${TEXT}"
